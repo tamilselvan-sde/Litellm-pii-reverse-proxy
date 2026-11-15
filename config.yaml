@@ -1,0 +1,133 @@
+model_list:
+
+  - model_name: gpt-oss-120b
+    litellm_params:
+      model: ollama/gpt-oss:120b-cloud
+      api_base: os.environ/OLLAMA_API_BASE
+      api_key: os.environ/OLLAMA_API_KEY
+
+  - model_name: qwen3.5
+    litellm_params:
+      model: ollama/qwen3.5:0.8b
+      api_base: os.environ/OLLAMA_API_BASE
+      api_key: os.environ/OLLAMA_API_KEY
+
+  - model_name: gemma3
+    litellm_params:
+      model: ollama/gemma3:270m
+      api_base: os.environ/OLLAMA_API_BASE
+      api_key: os.environ/OLLAMA_API_KEY
+
+
+  # ── vLLM alternative (instead of the Ollama endpoints above) ─────────
+  # 1. On the Windows host, serve WITHOUT an API key (omit --api-key):
+  #      vllm serve <hf-model-id> --port 8000
+  # 2. Set the endpoint in .env + docker-compose.yml:
+  #      VLLM_API_BASE=http://172.27.240.1:8000/v1     (same host IP as Ollama)
+  # 3. Comment the ollama entries above, uncomment the ones below.
+  #    Keep the same model_name: so clients, pii.sh and the PII guardrails
+  #    work unchanged. Copy each `model:` id from GET /v1/models on the
+  #    vLLM server. api_key must be a non-empty string (any value) because
+  #    LiteLLM requires one for openai/ routes - keyless vLLM ignores it.
+  #
+  #  - model_name: gpt-oss-120b
+  #    litellm_params:
+  #      model: openai/<served-model-id>       # e.g. openai/gpt-oss-120b
+  #      api_base: os.environ/VLLM_API_BASE
+  #      api_key: dummy
+  #
+  #  - model_name: qwen3.5
+  #    litellm_params:
+  #      model: openai/<served-model-id>       # e.g. openai/Qwen/Qwen3.5-0.8B
+  #      api_base: os.environ/VLLM_API_BASE
+  #      api_key: dummy
+  #
+  #  - model_name: gemma3
+  #    litellm_params:
+  #      model: openai/<served-model-id>       # e.g. openai/google/gemma-3-270m
+  #      api_base: os.environ/VLLM_API_BASE
+  #      api_key: dummy
+
+
+  # ── vLLM FALLBACK twins (Ollama stays PRIMARY, vLLM is backup) ───────
+  # Different from the swap block above: here BOTH backends are live at the
+  # same time. Keep every ollama entry above active AND uncomment these
+  # -vllm twins, then map them in litellm_settings.fallbacks (bottom of
+  # this file). Needs VLLM_API_BASE in .env + docker-compose.yml (see the
+  # comments there) and a keyless vLLM server on the host:
+  #   vllm serve <hf-model-id> --port 8000          (omit --api-key)
+  #
+  #  - model_name: gpt-oss-120b-vllm
+  #    litellm_params:
+  #      model: openai/<served-model-id>       # copy id from GET /v1/models
+  #      api_base: os.environ/VLLM_API_BASE
+  #      api_key: dummy
+  #
+  #  - model_name: qwen3.5-vllm
+  #    litellm_params:
+  #      model: openai/<served-model-id>       # copy id from GET /v1/models
+  #      api_base: os.environ/VLLM_API_BASE
+  #      api_key: dummy
+  #
+  #  - model_name: gemma3-vllm
+  #    litellm_params:
+  #      model: openai/<served-model-id>       # copy id from GET /v1/models
+  #      api_base: os.environ/VLLM_API_BASE
+  #      api_key: dummy
+
+
+guardrails:
+
+  # ── Runtime-managed PII masking: add/update/remove entities & recognizers
+  #    live via pii-registry (curl or Swagger UI http://localhost:5003/docs) —
+  #    changes apply on the NEXT request, no restarts ──
+  - guardrail_name: pii-crud
+
+    litellm_params:
+
+      guardrail: pii_crud_guardrail.PiiCrudGuardrail
+
+      mode: pre_call
+
+      default_on: true
+
+  # Same guardrail on the response phase: restores <TYPE_N> placeholders
+  - guardrail_name: pii-crud-restore
+
+    litellm_params:
+
+      guardrail: pii_crud_guardrail.PiiCrudGuardrail
+
+      mode: post_call
+
+      default_on: true
+
+
+litellm_settings:
+
+  set_verbose: false
+  json_logs: true
+
+  # ── Model fallback: Ollama primary → vLLM backup ────────────────────
+  # Only works with the "vLLM FALLBACK twins" entries in model_list above:
+  # keep the ollama deployments active, uncomment the -vllm twins AND the
+  # lines below. If an Ollama call fails (connection error, timeout, 5xx),
+  # LiteLLM retries the same request on vLLM automatically - clients keep
+  # calling "gemma3" etc. and never see the switch. PII masking runs
+  # before routing, so the fallback model receives already-masked input.
+  #
+  # fallbacks:
+  #   - gpt-oss-120b: ["gpt-oss-120b-vllm"]
+  #   - qwen3.5: ["qwen3.5-vllm"]
+  #   - gemma3: ["gemma3-vllm"]
+
+
+general_settings:
+
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+  database_url: os.environ/DATABASE_URL
+
+  # Store request/response content so the Logs UI shows prompts
+  store_prompts_in_spend_logs: true
+  store_model_in_db: true

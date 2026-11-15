@@ -1,0 +1,183 @@
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: litellm-postgres
+
+    command:
+      - postgres
+      - -p
+      - "9865"
+
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    ports:
+      - "127.0.0.1:9865:9865"
+
+    volumes:
+      - litellm_postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - pii-network
+
+    restart: unless-stopped
+
+
+  presidio-analyzer:
+    image: mcr.microsoft.com/presidio-analyzer:latest
+    container_name: presidio-analyzer
+
+    ports:
+      - "127.0.0.1:5002:3000"
+
+    networks:
+      - pii-network
+
+    restart: unless-stopped
+
+
+  presidio-anonymizer:
+    image: mcr.microsoft.com/presidio-anonymizer:latest
+    container_name: presidio-anonymizer
+
+    ports:
+      - "127.0.0.1:5001:3000"
+
+    networks:
+      - pii-network
+
+    restart: unless-stopped
+
+
+  pii-registry:
+    build: ./pii-registry
+    image: pii-registry:latest
+    container_name: pii-registry
+
+    ports:
+      - "127.0.0.1:5003:8080"
+
+    environment:
+      PII_DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD}@postgres:9865/litellm
+      PII_ADMIN_KEY: ${PII_ADMIN_KEY}
+      PII_ANALYZER_URL: http://presidio-analyzer:3000
+
+    depends_on:
+      - postgres
+
+    restart: unless-stopped
+
+    networks:
+      - pii-network
+
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.109.1
+    container_name: litellm-pii-gateway
+
+    ports:
+      - "0.0.0.0:4000:4000"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    environment:
+
+      # LiteLLM
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+
+      # LiteLLM UI
+      UI_USERNAME: ${UI_USERNAME}
+      UI_PASSWORD: ${UI_PASSWORD}
+
+      # PostgreSQL
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD}@postgres:9865/litellm
+
+      # Ollama running on Windows HOST (IP from .env - podman can't use host.docker.internal)
+      OLLAMA_API_BASE: ${OLLAMA_API_BASE}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+
+      # vLLM alternative (OpenAI-compatible server on the Windows HOST, no API
+      # key): start it with `vllm serve <model> --port 8000` WITHOUT --api-key,
+      # set VLLM_API_BASE in .env, then switch config.yaml to the commented
+      # openai/ model entries. Same host IP as Ollama (podman can't use
+      # host.docker.internal). No VLLM_API_KEY needed - the gateway sends a
+      # dummy value that keyless vLLM ignores.
+      # VLLM_API_BASE: ${VLLM_API_BASE}
+
+      # Presidio
+      PRESIDIO_ANALYZER_API_BASE: http://presidio-analyzer:3000
+      PRESIDIO_ANONYMIZER_API_BASE: http://presidio-anonymizer:3000
+
+      # Runtime PII config (pii-registry - CRUD via curl, no restarts)
+      PII_REGISTRY_URL: http://pii-registry:8080
+
+      # Timezone
+      TZ: Asia/Kolkata
+
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./pii_crud_guardrail.py:/app/pii_crud_guardrail.py:ro
+
+    depends_on:
+      - postgres
+      - presidio-analyzer
+      - presidio-anonymizer
+      - pii-registry
+
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--port"
+      - "4000"
+      - "--host"
+      - "0.0.0.0"
+
+    networks:
+      - pii-network
+
+    restart: unless-stopped
+
+
+  # Container management UI — manage/restart/inspect the whole stack from a
+  # browser instead of podman CLI. Open http://localhost:9000 on first start
+  # to create the admin account (must be done within 5 minutes of start,
+  # otherwise restart the container first).
+  #
+  # Socket note: podman-compose (Windows) translates absolute host paths like
+  # /var/run/docker.sock to C:\... — so the real podman API socket is mounted
+  # via the "podman_socket" named volume below (device resolves INSIDE the
+  # podman machine VM). In Portainer, add the environment with URL:
+  #   unix:///var/run/podman/podman.sock
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+
+    ports:
+      - "127.0.0.1:9000:9000"
+
+    volumes:
+      - podman_socket:/var/run/podman
+      - portainer_data:/data
+
+    restart: unless-stopped
+
+
+networks:
+  pii-network:
+    driver: bridge
+
+
+volumes:
+  litellm_postgres_data:
+  portainer_data:
+  podman_socket:
+    driver: local
+    driver_opts:
+      type: "none"
+      device: "/run/podman"
+      o: "bind"
