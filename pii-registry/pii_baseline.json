@@ -1,0 +1,237 @@
+{
+  "entities": [
+    {
+      "name": "PERSON",
+      "action": "MASK"
+    },
+    {
+      "name": "EMAIL_ADDRESS",
+      "action": "MASK"
+    },
+    {
+      "name": "PHONE_NUMBER",
+      "action": "MASK"
+    },
+    {
+      "name": "CREDIT_CARD",
+      "action": "MASK"
+    },
+    {
+      "name": "IBAN_CODE",
+      "action": "MASK"
+    },
+    {
+      "name": "IP_ADDRESS",
+      "action": "MASK"
+    },
+    {
+      "name": "SBIN_IFSC",
+      "action": "MASK"
+    },
+    {
+      "name": "KA_VEHICLE_NUMBER",
+      "action": "MASK"
+    },
+    {
+      "name": "UPI_ID",
+      "action": "MASK"
+    },
+    {
+      "name": "GSTIN",
+      "action": "MASK"
+    },
+    {
+      "name": "INDIAN_PAN",
+      "action": "MASK"
+    },
+    {
+      "name": "AADHAAR_NUMBER",
+      "action": "MASK"
+    },
+    {
+      "name": "INDIAN_PHONE",
+      "action": "MASK"
+    },
+    {
+      "name": "INDIAN_PINCODE",
+      "action": "MASK"
+    },
+    {
+      "name": "US_LOCAL_PHONE",
+      "action": "MASK"
+    }
+  ],
+  "recognizers": [
+    {
+      "name": "SBIN_IFSC_Recognizer",
+      "supported_entity": "SBIN_IFSC",
+      "patterns": [
+        {
+          "name": "SBIN_IFSC_PATTERN",
+          "regex": "\\bSBIN[A-Z0-9]{7}\\b",
+          "score": 0.95
+        }
+      ],
+      "context": [
+        "ifsc",
+        "ifsc code",
+        "bank",
+        "sbi",
+        "state bank",
+        "branch"
+      ]
+    },
+    {
+      "name": "KA_VEHICLE_NUMBER_Recognizer",
+      "supported_entity": "KA_VEHICLE_NUMBER",
+      "patterns": [
+        {
+          "name": "KA_VEHICLE_PATTERN",
+          "regex": "\\bKA[ -]?[0-9]{1,2}[ -]?[A-Z]{1,3}[ -]?[0-9]{1,4}\\b",
+          "score": 0.95
+        }
+      ],
+      "context": [
+        "vehicle",
+        "vehicle number",
+        "registration",
+        "registration number",
+        "car",
+        "bike",
+        "motorcycle",
+        "rc"
+      ]
+    },
+    {
+      "name": "UPI_ID_Recognizer",
+      "supported_entity": "UPI_ID",
+      "patterns": [
+        {
+          "name": "UPI_ID_PATTERN",
+          "regex": "\\b[A-Za-z0-9._-]+@upi\\b",
+          "score": 0.95
+        }
+      ],
+      "context": [
+        "upi",
+        "upi id",
+        "payment",
+        "pay",
+        "upi address"
+      ]
+    },
+    {
+      "name": "GSTIN_Recognizer",
+      "supported_entity": "GSTIN",
+      "patterns": [
+        {
+          "name": "GSTIN_PATTERN",
+          "regex": "\\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]\\b",
+          "score": 0.95
+        }
+      ],
+      "context": [
+        "gst",
+        "gstin",
+        "gst number",
+        "gst registration",
+        "tax",
+        "tax number"
+      ]
+    },
+    {
+      "name": "INDIAN_PAN_Recognizer",
+      "supported_entity": "INDIAN_PAN",
+      "patterns": [
+        {
+          "name": "PAN_PATTERN",
+          "regex": "\\b[A-Z]{5}[0-9]{4}[A-Z]\\b",
+          "score": 0.95
+        }
+      ],
+      "context": [
+        "pan",
+        "pan card",
+        "pan number",
+        "income tax",
+        "tax"
+      ]
+    },
+    {
+      "name": "AADHAAR_NUMBER_Recognizer",
+      "supported_entity": "AADHAAR_NUMBER",
+      "patterns": [
+        {
+          "name": "AADHAAR_PATTERN",
+          "regex": "\\b[2-9][0-9]{3}[ -]?[0-9]{4}[ -]?[0-9]{4}\\b",
+          "score": 0.95
+        }
+      ],
+      "context": [
+        "aadhaar",
+        "aadhar",
+        "aadhaar number",
+        "aadhar number",
+        "uid",
+        "uidai"
+      ]
+    },
+    {
+      "name": "INDIAN_PHONE_Recognizer",
+      "supported_entity": "INDIAN_PHONE",
+      "patterns": [
+        {
+          "name": "INDIAN_PHONE_PATTERN",
+          "regex": "\\b(?:\\+91[ -]?)?[6-9][0-9]{9}\\b",
+          "score": 0.9
+        }
+      ],
+      "context": [
+        "phone",
+        "mobile",
+        "mobile number",
+        "phone number",
+        "contact",
+        "contact number"
+      ]
+    },
+    {
+      "name": "US_LOCAL_PHONE_Recognizer",
+      "supported_entity": "US_LOCAL_PHONE",
+      "patterns": [
+        {
+          "name": "US_LOCAL_PHONE_PATTERN",
+          "regex": "\\b[2-9][0-9]{2}[ -][0-9]{4}\\b",
+          "score": 0.9
+        }
+      ],
+      "context": [
+        "phone",
+        "number",
+        "call",
+        "contact",
+        "tel",
+        "mobile"
+      ]
+    },
+    {
+      "name": "INDIAN_PINCODE_Recognizer",
+      "supported_entity": "INDIAN_PINCODE",
+      "patterns": [
+        {
+          "name": "INDIAN_PINCODE_PATTERN",
+          "regex": "\\b[1-9][0-9]{5}\\b",
+          "score": 0.85
+        }
+      ],
+      "context": [
+        "pincode",
+        "pin code",
+        "postal code",
+        "zip",
+        "zipcode",
+        "address"
+      ]
+    }
+  ]
+}
