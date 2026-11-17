@@ -398,6 +398,26 @@ guardrail rejects). That is LiteLLM's logging behavior, not a leak to the LLM.
 | `test 'text'` | `POST /test` |
 | `audit [n]` | `GET /audit?limit=n` |
 
+### 6.1 Guardrail lifecycle via `pii.sh` (gateway :4000, live — no restarts)
+
+| `./pii.sh …` | Equivalent gateway call |
+|---|---|
+| `guardrail-list` | `GET /guardrails/list` + `GET /guardrails/submissions` (DB-managed ones live there) |
+| `guardrail-add NAME API_BASE [pre_call\|post_call] [true\|false]` | `POST /guardrails/register` (team `pii-admin` auto-created) **+ auto-approve** → active |
+| `guardrail-show NAME_OR_ID` | `GET /guardrails/{id}` |
+| `guardrail-update NAME_OR_ID [pre_call\|post_call] [API_BASE]` | `GET /guardrails/{id}` + `PATCH /guardrails/{id}` |
+| `guardrail-delete NAME_OR_ID` | `DELETE /guardrails/{id}` |
+| `guardrail-submissions` / `guardrail-approve ID` | raw review-queue access (approve is normally automatic) |
+
+Notes:
+- Only `litellm_params.guardrail: "generic_guardrail_api"` is accepted by
+  `/guardrails/register` on v1.109.1 — the permanent masking guardrails
+  (`pii-crud` / `pii-crud-restore`) come from `config.yaml` and need no
+  management.
+- `guardrail-add` approves immediately, so the guardrail is **active** in the
+  same command; use `guardrail-submissions` + `guardrail-approve` if you want
+  a human review step instead.
+
 ---
 
 ## 7. Handy verification one-liners
@@ -429,6 +449,14 @@ Full end-to-end regression suite (makes ~17 real LLM calls):
 | Task | Where | Restarts needed |
 |---|---|---|
 | Add / update / delete PII entity or regex recognizer, MASK ↔ BLOCK | this doc (registry, :5003) | **none** |
-| Create / approve / delete a LiteLLM guardrail (`generic_guardrail_api`) | `PII_CRUD_GUARDRAIL.md` §9 (gateway, :4000) | **none** |
+| Create / approve / update / delete a LiteLLM guardrail | `./pii.sh guardrail-*` (gateway, :4000) — see §6.1 | **none** |
 | Manage containers in a browser | Portainer http://localhost:9000 | n/a (it *is* the restart tool, if ever needed) |
 | Change model backend (Ollama ↔ vLLM) or guardrail entries in `config.yaml` | edit file + `podman compose up -d --force-recreate litellm` | this is the only restart path |
+
+### 8.1 Where the data lives (all in the Postgres container — nothing is a file DB)
+
+| Data | Store |
+|---|---|
+| PII entities, recognizers, audit trail, config version | Postgres container → database `pii_registry` (self-provisioned by pii-registry on startup — survives redeploys, volume `litellm_postgres_data`) |
+| LiteLLM keys, teams, guardrail registrations, spend logs | Postgres container → database `litellm` |
+| `pii_baseline.json` | one-time seed source only — after first boot the DB is the source of truth |

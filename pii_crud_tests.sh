@@ -23,9 +23,20 @@ assert_not(){ if has "$1" "$2"; then bad "$3  [found: $1]"; else ok "$3"; fi; }
 # even across repeated suite runs (markers must never contain PII - it gets masked!)
 # NOTE: tag() uses printf -v so the counter increments in THIS shell —
 # never call it inside $() or the sequence number will be lost to a subshell.
-RUN_TAG="w$(date +%M%S)x"
+#
+# Marker format "$(date +%M%S) <T_${SEQ}>": BOTH parts must survive masking —
+#   1. "<T_N>" is deliberately placeholder-shaped: the guardrail's
+#      PLACEHOLDER_RE guarantees tokens like <T_22> are NEVER masked.
+#   2. The run number is a bare 4-digit number (no letter wrapper!):
+#      letter+digit tokens like "w3026x" get flagged as PERSON by presidio's
+#      NER (context-dependent) and masked, which broke the DB poll. A bare
+#      4-digit number matches no enabled recognizer regex and is never a NER
+#      entity. wait_input() also filters by startTime >= suite start, so
+#      markers never collide with an earlier suite run that reused the tag.
+RUN_TAG="$(date +%M%S)"
+SUITE_START="$(date -u '+%Y-%m-%d %H:%M:%S')"
 SEQ=0
-tag(){ SEQ=$((SEQ+1)); printf -v "$1" '%s' "$RUN_TAG n$SEQ: $2"; }
+tag(){ SEQ=$((SEQ+1)); printf -v "$1" '%s' "$RUN_TAG <T_${SEQ}>: $2"; }
 
 # JSON body built by python (immune to MSYS backslash mangling) -> file -> curl
 JBODY="$TMP/pii_body.json"
@@ -36,11 +47,12 @@ jpatch(){ python -c "import json,sys; open(sys.argv[1],'w').write(json.dumps(jso
 
 PSQL=(podman exec litellm-postgres psql -U litellm -p 9865 -d litellm -t -A -c)
 # Deterministic DB read: wait for THIS run's row (unique tag marker), since
-# LiteLLM writes spend logs asynchronously.
+# LiteLLM writes spend logs asynchronously. The startTime floor keeps polls
+# from matching rows of an earlier suite run that reused the same MMSS tag.
 wait_input(){ # marker -> that request's masked user content
   local row=""
   for i in $(seq 1 40); do
-    row=$("${PSQL[@]}" "SELECT proxy_server_request::jsonb->'messages'->-1->>'content' FROM \"LiteLLM_SpendLogs\" WHERE proxy_server_request::jsonb->'messages'->-1->>'content' LIKE '%$1%' ORDER BY \"startTime\" DESC LIMIT 1")
+    row=$("${PSQL[@]}" "SELECT proxy_server_request::jsonb->'messages'->-1->>'content' FROM \"LiteLLM_SpendLogs\" WHERE proxy_server_request::jsonb->'messages'->-1->>'content' LIKE '%$1%' AND \"startTime\" >= '$SUITE_START+00' ORDER BY \"startTime\" DESC LIMIT 1")
     [ -n "$row" ] && { echo "$row"; return 0; }
     sleep 1
   done
@@ -95,7 +107,7 @@ t=$(jpost /test '{"text":"Contact ravi@asmltd.com now"}')
 assert_in '<ASML_EMAIL_1>' "$t" "/test masks custom domain (custom wins over generic EMAIL_ADDRESS)"
 tag m "My work email is ravi@asmltd.com. Note it down."
 code=$(gw_wait "$m" "$TMP/c1.json" 100 qwen3.5 nothink)
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_in '<ASML_EMAIL_1>' "$inp" "gateway masks ASML email (HTTP $code)"
 assert_not 'ravi@asmltd.com' "$inp" "raw ASML email never reaches LLM"
 tag m "My work email is ravi@asmltd.com. Reply exactly and nothing else: noted <ASML_EMAIL_1>."
@@ -114,19 +126,19 @@ assert_in '<ASML_EMAIL_2>' "$t" "updated regex catches second domain"
 jpatch /recognizers/ASML_EMAIL '{"enabled":false}' >/dev/null
 tag m "Contact me at ravi@asmltd.com about the order."
 gw_wait "$m" "$TMP/c2.json" 60 >/dev/null
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_not '<ASML_EMAIL_' "$inp" "disabled recognizer: no ASML-specific token"
 assert_in '<EMAIL_ADDRESS_' "$inp" "disabled recognizer: generic EMAIL_ADDRESS still masks"
 jpatch /recognizers/ASML_EMAIL '{"enabled":true}' >/dev/null
 tag m "Contact me at ravi@asmltd.com about the refund."
 gw_wait "$m" "$TMP/c3.json" 60 >/dev/null
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_in '<ASML_EMAIL_1>' "$inp" "re-enabled recognizer masks again"
 assert_not 'ravi@asmltd.com' "$inp" "raw email gone again after re-enable"
 reg_del /recognizers/ASML_EMAIL >/dev/null
 tag m "Contact me at ravi@asmltd.com about the invoice."
 gw_wait "$m" "$TMP/c4.json" 60 >/dev/null
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_not '<ASML_EMAIL_' "$inp" "deleted recognizer: no ASML-specific token"
 assert_in '<EMAIL_ADDRESS_' "$inp" "deleted recognizer: generic EMAIL_ADDRESS still masks"
 reg_del /entities/ASML_EMAIL >/dev/null
@@ -138,7 +150,7 @@ r=$(jpost /entities '{"name":"DATE_TIME","action":"MASK"}')
 assert_in '"created"' "$r" "POST /entities creates DATE_TIME"
 tag m "Report due date is 2026-11-15. Reply: A."
 code=$(gw_wait "$m" "$TMP/d1.json" 80)
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_in '<DATE_TIME_' "$inp" "gateway masks date after runtime entity add (HTTP $code)"
 assert_not '2026-11-15' "$inp" "raw date never reaches LLM"
 jpatch /entities/DATE_TIME '{"action":"BLOCK"}' >/dev/null
@@ -147,11 +159,11 @@ code=$(gw "Report due date is 2026-11-15. Send status." "$TMP/d2.json" 60)
 jpatch /entities/DATE_TIME '{"action":"MASK"}' >/dev/null
 tag m "Report due date is 2026-11-15. Reply: B."
 code=$(gw_wait "$m" "$TMP/d3.json" 80)
-assert_in '<DATE_TIME_' "$(wait_input "$RUN_TAG n$SEQ")" "back to MASK: date masked again (HTTP $code)"
+assert_in '<DATE_TIME_' "$(wait_input "$RUN_TAG <T_${SEQ}>")" "back to MASK: date masked again (HTTP $code)"
 reg_del /entities/DATE_TIME >/dev/null
 tag m "Report due date is 2026-11-15. Reply: C."
 gw_wait "$m" "$TMP/d4.json" 80 >/dev/null
-assert_not '<DATE_TIME_' "$(wait_input "$RUN_TAG n$SEQ")" "deleted entity: date no longer masked"
+assert_not '<DATE_TIME_' "$(wait_input "$RUN_TAG <T_${SEQ}>")" "deleted entity: date no longer masked"
 
 # ── E. BLOCK on a built-in entity (PERSON) ───────────────────
 hdr "E. BLOCK on built-in entity (PERSON)"
@@ -161,7 +173,7 @@ code=$(gw "My name is Ravi Kumar, call me." "$TMP/e1.json" 60)
 jpatch /entities/PERSON '{"action":"MASK"}' >/dev/null
 tag m "My name is Ravi Kumar, ping me later."
 code=$(gw_wait "$m" "$TMP/e2.json" 60)
-assert_in '<PERSON_1>' "$(wait_input "$RUN_TAG n$SEQ")" "PERSON back to MASK: name masked (HTTP $code)"
+assert_in '<PERSON_1>' "$(wait_input "$RUN_TAG <T_${SEQ}>")" "PERSON back to MASK: name masked (HTTP $code)"
 
 # ── F. validation & auth ─────────────────────────────────────
 hdr "F. Input validation & auth"
@@ -178,47 +190,65 @@ assert_in 'UPPERCASE_SNAKE' "$r" "bad entity name rejected (400)"
 hdr "G. Regression - all seeded entities still mask"
 tag m "My name is Ravi Kumar, mobile 9876543210. Say hi."
 gw_wait "$m" "$TMP/g1.json" 60 >/dev/null
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_in '<PERSON_' "$inp" "PERSON masked"
 assert_in '<INDIAN_PHONE_' "$inp" "INDIAN_PHONE masked"
 assert_not '9876543210' "$inp" "raw mobile never reaches LLM"
 tag m "My PAN is ABCDE1234F and Aadhaar is 2345 6789 0123. Confirm KYC."
 gw_wait "$m" "$TMP/g2.json" 60 >/dev/null
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_in '<INDIAN_PAN_' "$inp" "PAN masked"
 assert_in '<AADHAAR_NUMBER_' "$inp" "Aadhaar masked"
 assert_not 'ABCDE1234F' "$inp" "raw PAN never reaches LLM"
 tag m "My email is ravi@gmail.com and my card is 4111 1111 1111 1111."
 gw_wait "$m" "$TMP/g3.json" 60 >/dev/null
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_in '<EMAIL_ADDRESS_' "$inp" "email masked"
 assert_in '<CREDIT_CARD_' "$inp" "credit card masked"
 assert_not '1111.' "$inp" "card digits never reach LLM"
 tag m "Send payment to ravi@upi, bank IFSC SBIN0001234."
 gw_wait "$m" "$TMP/g4.json" 60 >/dev/null
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_in '<UPI_ID_' "$inp" "UPI masked"
 assert_in '<SBIN_IFSC_' "$inp" "IFSC masked"
 tag m "GSTIN 29ABCDE1234F1Z5, car KA 01 AB 1234, pincode 560001. Summarize."
 gw_wait "$m" "$TMP/g5.json" 60 >/dev/null
-inp=$(wait_input "$RUN_TAG n$SEQ")
+inp=$(wait_input "$RUN_TAG <T_${SEQ}>")
 assert_in '<GSTIN_' "$inp" "GSTIN masked"
 assert_in '<KA_VEHICLE_NUMBER_' "$inp" "vehicle masked"
 assert_in '<INDIAN_PINCODE_' "$inp" "pincode masked"
 tag m "My office line is 555-1234. Note it."
 gw_wait "$m" "$TMP/g6.json" 60 >/dev/null
-assert_in '<US_LOCAL_PHONE_' "$(wait_input "$RUN_TAG n$SEQ")" "US local phone masked"
+assert_in '<US_LOCAL_PHONE_' "$(wait_input "$RUN_TAG <T_${SEQ}>")" "US local phone masked"
 tag m "What is the capital of Karnataka? One word."
 gw_wait "$m" "$TMP/g7.json" 60 >/dev/null
-assert_not '<' "$(wait_input "$RUN_TAG n$SEQ")" "negative test: no placeholders injected on PII-free text"
+# strip the (expected) <T_N> marker token before checking for stray placeholders
+assert_not '<' "$(wait_input "$RUN_TAG <T_${SEQ}>" | sed -E 's/<T_[0-9]+>//g')" "negative test: no placeholders injected on PII-free text"
 
 # ── H. fail-safety: registry down ────────────────────────────
-hdr "H. Fail-safety - registry down (last-known-good)"
+# Two architectures, different (both privacy-safe) behavior when pii-registry
+# is down:
+#   default (config.yaml pii-crud guardrail): last-known-good cached config ->
+#     masking continues, HTTP 200.
+#   REJECTS_ON_REGISTRY_DOWN=1 (API-registered generic_guardrail_api): litellm
+#     fail-closed -> request rejected (HTTP 500), never sent unmasked.
+hdr "H. Fail-safety - registry down"
 podman stop pii-registry >/dev/null 2>&1
 sleep 2
 tag m "My name is Ravi Kumar, email ravi@gmail.com. Greetings."
-code=$(gw_wait "$m" "$TMP/h1.json" 60)
-assert_in '<PERSON_' "$(wait_input "$RUN_TAG n$SEQ")" "masking continues with registry stopped (cached config, HTTP $code)"
+if [ "${REJECTS_ON_REGISTRY_DOWN:-0}" = "1" ]; then
+  code=$(gw "My name is Ravi Kumar, email ravi@gmail.com. Greetings." "$TMP/h1.json" 60)
+  if [ "$code" = "500" ]; then
+    ok "fail-closed: request rejected while registry down (HTTP 500, never unmasked)"
+  elif [ "$code" = "400" ]; then
+    ok "fail-closed: request rejected while registry down (HTTP 400, never unmasked)"
+  else
+    bad "fail-closed expected 4xx/5xx while registry down, got $code"
+  fi
+else
+  code=$(gw_wait "$m" "$TMP/h1.json" 60)
+  assert_in '<PERSON_' "$(wait_input "$RUN_TAG <T_${SEQ}>")" "masking continues with registry stopped (cached config, HTTP $code)"
+fi
 podman start pii-registry >/dev/null 2>&1
 sleep 4
 assert_in '"ok"' "$(curl -s --max-time 10 "$REG/health")" "registry back up"

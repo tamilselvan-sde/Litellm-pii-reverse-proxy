@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runtime PII entity/recognizer CRUD — no container restarts needed.
+# Runtime PII + guardrail management — no container restarts needed.
 # Changes take effect on the NEXT request through the LiteLLM gateway.
 #
 # Usage examples:
@@ -14,17 +14,150 @@
 #   ./pii.sh remove ASML_EMAIL
 #   ./pii.sh test 'Contact me at ravi@asmltd.com'
 #   ./pii.sh audit 15
+#
+# LiteLLM guardrail lifecycle (DB-managed, live without restarts):
+#   ./pii.sh guardrail-list                         # all guardrails
+#   ./pii.sh guardrail-add my-gr http://my-svc:8000 [pre_call|post_call] [true|false]
+#                                                   # register + approve -> active
+#   ./pii.sh guardrail-show my-gr                   # details by id or name
+#   ./pii.sh guardrail-update my-gr post_call       # change mode (and api_base opt)
+#   ./pii.sh guardrail-delete my-gr
 set -u
 cd "$(dirname "$0")"
 . ./.env
 REG="http://localhost:5003"
+GATE="http://localhost:4000"
 AK="$PII_ADMIN_KEY"
+MK="$LITELLM_MASTER_KEY"
 
 json_post() { curl -s --max-time 30 -X POST "$REG$1" -H "X-API-Key: $AK" -H "Content-Type: application/json" -d "$2"; }
 json_patch() { curl -s --max-time 30 -X PATCH "$REG$1" -H "X-API-Key: $AK" -H "Content-Type: application/json" -d "$2"; }
 # JSON body built by python - safe for any regex (MSYS mangles backslashes in args)
 jbody() { python -c "import json,sys; open(sys.argv[1],'w').write(json.dumps(json.loads(sys.argv[2])))" "$TMPJ" "$1"; }
 TMPJ="$(mktemp)"
+
+# ── LiteLLM guardrail API (gateway :4000, master key) — python helper ──
+# All JSON built/parsed in python: immune to MSYS backslash/quote mangling.
+grapi() { # grapi <subcommand> [args...]  (see dispatch below)
+  python - "$GATE" "$MK" "$@" <<'PY'
+import json, sys, urllib.request, urllib.error
+
+gate, mk = sys.argv[1], sys.argv[2]
+sub = sys.argv[3]
+args = sys.argv[4:]
+
+def call(path, data=None, method=None):
+    req = urllib.request.Request(
+        gate + path,
+        data=json.dumps(data).encode() if data is not None else None,
+        headers={"Authorization": "Bearer " + mk, "Content-Type": "application/json"},
+        method=method or ("POST" if data is not None else "GET"),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read().decode()
+            return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"error": str(e)}
+
+def list_all():
+    """config.yaml guardrails + DB-managed ones (they live in /submissions)."""
+    out = []
+    for g in call("/guardrails/list").get("guardrails", []):
+        out.append(g)
+    for g in call("/guardrails/submissions").get("submissions", []):
+        if not any(x.get("guardrail_id") == g.get("guardrail_id") for x in out):
+            out.append(g)
+    return out
+
+def resolve(id_or_name):
+    for g in list_all():
+        if g.get("guardrail_id") == id_or_name or g.get("guardrail_name") == id_or_name:
+            return g
+    return None
+
+def ensure_team():
+    for t in call("/team/list?page=1"):
+        if t.get("team_alias") == "pii-admin":
+            return t["team_id"]
+    return call("/team/new", {"team_alias": "pii-admin"})["team_id"]
+
+def bail(msg):
+    print(msg)
+    sys.exit(1)
+
+if sub == "list":
+    for g in list_all():
+        p = g.get("litellm_params") or {}
+        status = g.get("status") or "config"
+        gid = g.get("guardrail_id") or "(config.yaml)"
+        print(f"  {g['guardrail_name']:<22} {(p.get('mode') or ''):<9} "
+              f"default_on={str(p.get('default_on')):<5} {status:<8} {gid}")
+    sys.exit(0)
+
+if sub == "add":  # name api_base [mode] [default_on] [api_key]
+    if len(args) < 2:
+        bail("usage: guardrail-add NAME API_BASE [pre_call|post_call] [true|false]")
+    name, api_base = args[0], args[1]
+    mode = args[2] if len(args) > 2 else "pre_call"
+    default_on = args[3].lower() == "true" if len(args) > 3 else False
+    api_key = args[4] if len(args) > 4 and args[4] else None
+    if mode not in ("pre_call", "post_call"):
+        bail("mode must be pre_call or post_call")
+    payload = {
+        "guardrail_name": name,
+        "team_id": ensure_team(),
+        "litellm_params": {
+            "guardrail": "generic_guardrail_api",  # only accepted value on v1.109.1
+            "mode": mode,
+            "default_on": default_on,
+            "api_base": api_base,
+        },
+    }
+    if api_key:  # forwarded by litellm as x-api-key (registry auth)
+        payload["litellm_params"]["api_key"] = api_key
+    reg = call("/guardrails/register", payload)
+    gid = reg.get("guardrail_id")
+    if not gid:
+        bail("register failed: " + json.dumps(reg))
+    print(f"registered {name} -> {gid} (status: {reg.get('status')})")
+    app = call(f"/guardrails/submissions/{gid}/approve", {})
+    print("approved -> " + json.dumps(app.get("status") or app))
+    sys.exit(0)
+
+g = resolve(args[0]) if args else None
+if g is None:
+    bail(f"guardrail '{args[0] if args else ''}' not found")
+gid = g.get("guardrail_id") or g.get("guardrail_name")
+
+if sub == "show":
+    print(json.dumps(call(f"/guardrails/{gid}"), indent=2))
+elif sub == "update":  # id_or_name [mode] [api_base]
+    mode = args[1] if len(args) > 1 else None
+    api_base = args[2] if len(args) > 2 else None
+    lp = g.get("litellm_params") or {}
+    lp["guardrail"] = "generic_guardrail_api"
+    if mode:
+        if mode not in ("pre_call", "post_call"):
+            bail("mode must be pre_call or post_call")
+        lp["mode"] = mode
+    if api_base:
+        lp["api_base"] = api_base
+    body = {"guardrail_name": g["guardrail_name"], "litellm_params": lp}
+    out = call(f"/guardrails/{gid}", body, method="PATCH")
+    print(json.dumps({"status": "updated", "name": out.get("guardrail_name"),
+                      "mode": (out.get("litellm_params") or {}).get("mode"),
+                      "api_base": (out.get("litellm_params") or {}).get("api_base")}))
+elif sub == "delete":
+    out = call(f"/guardrails/{gid}", method="DELETE")
+    print(json.dumps(out))
+else:
+    bail(f"unknown guardrail subcommand: {sub}")
+PY
+}
 
 cmd="${1:-list}"; shift || true
 
@@ -79,6 +212,49 @@ print('masked:', d['masked_text'])"
 
   audit)
     curl -s "$REG/audit?limit=${1:-15}" | python -c "import json,sys; [print(f\"  {a['ts'][:19]}  {a['op']:<18} {a['target']}\") for a in json.load(sys.stdin)]"
+    ;;
+
+  # ── LiteLLM guardrail lifecycle (DB-managed — live, no restarts) ──
+  guardrail-list)
+    grapi list
+    ;;
+
+  guardrail-add)
+    [ $# -lt 2 ] && { echo "usage: ./pii.sh guardrail-add NAME API_BASE [pre_call|post_call] [default_on true|false]"; exit 1; }
+    # $AK (PII_ADMIN_KEY) is appended automatically -> litellm sends it as
+    # x-api-key so the registry guardrail endpoint enforces auth
+    grapi add "$@" "$AK"
+    ;;
+
+  guardrail-show)
+    [ $# -lt 1 ] && { echo "usage: ./pii.sh guardrail-show NAME_OR_ID"; exit 1; }
+    grapi show "$@"
+    ;;
+
+  guardrail-update)
+    [ $# -lt 2 ] && { echo "usage: ./pii.sh guardrail-update NAME_OR_ID [pre_call|post_call] [API_BASE]"; exit 1; }
+    grapi update "$@"
+    ;;
+
+  guardrail-delete)
+    [ $# -lt 1 ] && { echo "usage: ./pii.sh guardrail-delete NAME_OR_ID"; exit 1; }
+    grapi delete "$@"
+    ;;
+
+  guardrail-submissions)
+    python -c "
+import json, urllib.request
+req = urllib.request.Request('$GATE/guardrails/submissions', headers={'Authorization': 'Bearer $MK'})
+print(json.dumps(json.load(urllib.request.urlopen(req)), indent=2))"
+    ;;
+
+  guardrail-approve)
+    [ $# -lt 1 ] && { echo "usage: ./pii.sh guardrail-approve GUARDRAIL_ID"; exit 1; }
+    python -c "
+import json, urllib.request
+req = urllib.request.Request('$GATE/guardrails/submissions/$1/approve', data=b'{}',
+    headers={'Authorization': 'Bearer $MK', 'Content-Type': 'application/json'}, method='POST')
+print(json.dumps(json.load(urllib.request.urlopen(req)), indent=2))"
     ;;
 
   *)

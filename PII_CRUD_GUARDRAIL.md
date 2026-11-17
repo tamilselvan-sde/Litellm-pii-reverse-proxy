@@ -194,6 +194,11 @@ The gateway itself exposes guardrail APIs (admin key required,
 
 ### 9.1 Tested lifecycle (curl, no restarts at any step)
 
+> One-command version: `./pii.sh guardrail-add NAME API_BASE [pre_call|post_call] [true|false]`
+> (registers, auto-approves → active). Also `guardrail-list`, `guardrail-show`,
+> `guardrail-update NAME [mode] [api_base]`, `guardrail-delete`. See
+> `PII_CRUD_API.md` §6.1.
+
 ```bash
 MK="sk-litellm-master-key-2026"   # LITELLM_MASTER_KEY
 GATE="http://localhost:4000"
