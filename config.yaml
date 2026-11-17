@@ -76,31 +76,33 @@ model_list:
   #      api_key: dummy
 
 
-guardrails:
-
-  # ── Runtime-managed PII masking: add/update/remove entities & recognizers
-  #    live via pii-registry (curl or Swagger UI http://localhost:5003/docs) —
-  #    changes apply on the NEXT request, no restarts ──
-  - guardrail_name: pii-crud
-
-    litellm_params:
-
-      guardrail: pii_crud_guardrail.PiiCrudGuardrail
-
-      mode: pre_call
-
-      default_on: true
-
-  # Same guardrail on the response phase: restores <TYPE_N> placeholders
-  - guardrail_name: pii-crud-restore
-
-    litellm_params:
-
-      guardrail: pii_crud_guardrail.PiiCrudGuardrail
-
-      mode: post_call
-
-      default_on: true
+# ── Guardrails are now managed AT RUNTIME via the LiteLLM gateway API and
+#    stored in the litellm Postgres DB — no config.yaml entries, no restarts:
+#      ./pii.sh guardrail-add pii-presidio http://pii-registry:8080 pre_call true
+#      ./pii.sh guardrail-add pii-presidio-restore http://pii-registry:8080 post_call true
+#      ./pii.sh guardrail-list | guardrail-show NAME | guardrail-update ...
+#      ./pii.sh guardrail-delete NAME
+#    The registry (pii-registry :5003) implements the Generic Guardrail API
+#    protocol (/beta/litellm_basic_guardrail_api): presidio masking driven by
+#    its entity/recognizer CRUD (MASK/BLOCK), plus <TYPE_N> restore on the
+#    response. Every request re-reads the live registry config, so entity
+#    changes apply on the next request.
+#
+#    Rollback option (file-based guardrails): uncomment the two entries below
+#    and run `podman compose up -d --force-recreate litellm` (the only path
+#    that needs a restart). pii_crud_guardrail.py stays mounted for this.
+#
+#  - guardrail_name: pii-crud
+#    litellm_params:
+#      guardrail: pii_crud_guardrail.PiiCrudGuardrail
+#      mode: pre_call
+#      default_on: true
+#
+#  - guardrail_name: pii-crud-restore
+#    litellm_params:
+#      guardrail: pii_crud_guardrail.PiiCrudGuardrail
+#      mode: post_call
+#      default_on: true
 
 
 litellm_settings:

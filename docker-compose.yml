@@ -20,6 +20,13 @@ services:
     volumes:
       - litellm_postgres_data:/var/lib/postgresql/data
 
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm -p 9865"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
     networks:
       - pii-network
 
@@ -33,6 +40,14 @@ services:
     ports:
       - "127.0.0.1:5002:3000"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      # first start downloads/spins up the NLP models — allow a long warmup
+      start_period: 120s
+
     networks:
       - pii-network
 
@@ -45,6 +60,13 @@ services:
 
     ports:
       - "127.0.0.1:5001:3000"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
     networks:
       - pii-network
@@ -61,12 +83,24 @@ services:
       - "127.0.0.1:5003:8080"
 
     environment:
-      PII_DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD}@postgres:9865/litellm
+      # Own database (NOT the litellm one) — created automatically by the
+      # app on startup if missing (self-provisioning, no init script needed)
+      PII_DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD}@postgres:9865/pii_registry
       PII_ADMIN_KEY: ${PII_ADMIN_KEY}
       PII_ANALYZER_URL: http://presidio-analyzer:3000
 
+    # Service-level healthcheck: podman builds OCI images, where the
+    # Dockerfile HEALTHCHECK is ignored — so define it here instead.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
     restart: unless-stopped
 
@@ -116,6 +150,11 @@ services:
       # Runtime PII config (pii-registry - CRUD via curl, no restarts)
       PII_REGISTRY_URL: http://pii-registry:8080
 
+      # Fail-closed: if the registry/analyzer is unreachable AND there is no
+      # cached config, reject requests instead of sending raw PII. Default is
+      # false in the guardrail code; kept explicit so prod behavior is visible.
+      PII_FAIL_OPEN: "false"
+
       # Timezone
       TZ: Asia/Kolkata
 
@@ -124,10 +163,21 @@ services:
       - ./pii_crud_guardrail.py:/app/pii_crud_guardrail.py:ro
 
     depends_on:
-      - postgres
-      - presidio-analyzer
-      - presidio-anonymizer
-      - pii-registry
+      postgres:
+        condition: service_healthy
+      presidio-analyzer:
+        condition: service_started
+      presidio-anonymizer:
+        condition: service_started
+      pii-registry:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
 
     command:
       - "--config"
