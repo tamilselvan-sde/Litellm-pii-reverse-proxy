@@ -1,10 +1,12 @@
 """
 PII Registry — runtime CRUD for PII entities & custom regex recognizers.
 
-Config lives in Postgres (same DB as LiteLLM). The LiteLLM gateway's
-pii_crud_guardrail fetches /config on every request, so any change made
-through this API (curl or Swagger UI) takes effect on the NEXT request —
-no container restarts.
+Config lives in its own `pii_registry` Postgres database (never the `litellm`
+one — its tables would block LiteLLM's Prisma migrations). The database is
+created here automatically if missing, so the stack is self-provisioning on
+any fresh Postgres volume. The LiteLLM gateway's pii_crud_guardrail fetches
+/config on every request, so any change made through this API (curl or
+Swagger UI) takes effect on the NEXT request — no container restarts.
 
 Interactive docs:
   http://localhost:5003/docs   ← Swagger UI (click "Authorize", paste admin key)
@@ -18,11 +20,14 @@ import json
 import os
 import re
 import time
+from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
 import httpx
 import psycopg
+from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -32,9 +37,11 @@ ADMIN_KEY = os.getenv("PII_ADMIN_KEY", "")
 ANALYZER = os.getenv("PII_ANALYZER_URL", "http://presidio-analyzer:3000").rstrip("/")
 NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 
+_pool: Optional[ConnectionPool] = None
+
 app = FastAPI(
     title="PII Registry",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Runtime CRUD for PII entities & custom regex recognizers used by the "
         "LiteLLM gateway's `pii-crud` guardrail.\n\n"
@@ -74,6 +81,7 @@ CREATE TABLE IF NOT EXISTS pii_config_audit (
   payload JSONB,
   actor   TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS pii_config_audit_ts_idx ON pii_config_audit (ts DESC);
 CREATE TABLE IF NOT EXISTS pii_config_version (
   id      INT PRIMARY KEY DEFAULT 1,
   version BIGINT NOT NULL DEFAULT 1
@@ -81,25 +89,61 @@ CREATE TABLE IF NOT EXISTS pii_config_version (
 """
 
 
+def _get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            DB_URL,
+            name="pii-registry-pool",
+            min_size=2,
+            max_size=10,
+            timeout=15,
+            # Validate connections before handing them out — survives a
+            # Postgres restart without serving dead connections.
+            check=ConnectionPool.check_connection,
+            kwargs={"autocommit": True, "row_factory": dict_row},
+        )
+    return _pool
+
+
+@contextmanager
+def tx():
+    """Atomically run several statements in one pooled connection.
+
+    Yields a cursor (dict rows). Every statement joins one BEGIN/COMMIT, so
+    e.g. insert + audit + version bump either all land or none do.
+    """
+    with _get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                yield cur
+
+
 def q(sql, params=(), fetch=False):
-    """One-shot query with its own connection (local DB, cheap & thread-safe)."""
-    with psycopg.connect(DB_URL, autocommit=True) as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
+    """One-shot query on a pooled connection (local DB, cheap & thread-safe)."""
+    with _get_pool().connection() as conn:
+        with conn.cursor() as cur:
             cur.execute(sql, params)
             if fetch:
                 return cur.fetchall()
             return None
 
 
-def audit(op, target, payload=None, actor="admin"):
-    q(
-        "INSERT INTO pii_config_audit(op, target, payload, actor) VALUES (%s, %s, %s::jsonb, %s)",
-        (op, target, json.dumps(payload) if payload is not None else None, actor),
-    )
+def audit(op, target, payload=None, actor="admin", cur=None):
+    sql = "INSERT INTO pii_config_audit(op, target, payload, actor) VALUES (%s, %s, %s::jsonb, %s)"
+    args = (op, target, json.dumps(payload) if payload is not None else None, actor)
+    if cur is not None:
+        cur.execute(sql, args)
+    else:
+        q(sql, args)
 
 
-def bump_version():
-    q("UPDATE pii_config_version SET version = version + 1 WHERE id = 1")
+def bump_version(cur=None):
+    sql = "UPDATE pii_config_version SET version = version + 1 WHERE id = 1"
+    if cur is not None:
+        cur.execute(sql)
+    else:
+        q(sql)
 
 
 def current_version():
@@ -117,6 +161,24 @@ def effective():
     }
 
 
+def ensure_database():
+    """Create the `pii_registry` database if it doesn't exist yet.
+
+    Self-provisioning: works on any fresh Postgres volume AND on volumes
+    that were initialized before this change (replaces
+    docker-entrypoint-initdb.d/init-pii-db.sql, which only ever ran on
+    first volume init).
+    """
+    # Same host/port/credentials, maintenance database `postgres`
+    maintenance_url = DB_URL.rsplit("/", 1)[0] + "/postgres"
+    with psycopg.connect(maintenance_url, autocommit=True) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname = 'pii_registry'"
+        ).fetchone()
+        if exists is None:
+            conn.execute("CREATE DATABASE pii_registry")
+
+
 def init_db():
     q(DDL)
     q("INSERT INTO pii_config_version(id, version) VALUES (1, 1) ON CONFLICT (id) DO NOTHING")
@@ -124,31 +186,52 @@ def init_db():
     if not q("SELECT 1 FROM pii_entities LIMIT 1", fetch=True):
         with open("/app/pii_baseline.json", "r", encoding="utf-8") as f:
             base = json.load(f)
-        for e in base.get("entities", []):
-            q(
-                "INSERT INTO pii_entities(name, action, enabled, updated_by)"
-                " VALUES (%s, %s, TRUE, 'seed') ON CONFLICT (name) DO NOTHING",
-                (e["name"], e.get("action", "MASK")),
-            )
-            audit("seed-entity", e["name"], e, "seed")
-        for r in base.get("recognizers", []):
-            q(
-                "INSERT INTO pii_recognizers(name, spec, enabled, updated_by)"
-                " VALUES (%s, %s::jsonb, TRUE, 'seed') ON CONFLICT (name) DO NOTHING",
-                (r["name"], json.dumps(r)),
-            )
-            audit("seed-recognizer", r["name"], r, "seed")
-        bump_version()
+        with tx() as cur:  # whole seed lands atomically
+            for e in base.get("entities", []):
+                cur.execute(
+                    "INSERT INTO pii_entities(name, action, enabled, updated_by)"
+                    " VALUES (%s, %s, TRUE, 'seed') ON CONFLICT (name) DO NOTHING",
+                    (e["name"], e.get("action", "MASK")),
+                )
+                audit("seed-entity", e["name"], e, "seed", cur=cur)
+            for r in base.get("recognizers", []):
+                cur.execute(
+                    "INSERT INTO pii_recognizers(name, spec, enabled, updated_by)"
+                    " VALUES (%s, %s::jsonb, TRUE, 'seed') ON CONFLICT (name) DO NOTHING",
+                    (r["name"], json.dumps(r)),
+                )
+                audit("seed-recognizer", r["name"], r, "seed", cur=cur)
+            bump_version(cur=cur)
 
 
-for _attempt in range(30):
-    try:
-        init_db()
-        break
-    except Exception:
-        if _attempt == 29:
-            raise
-        time.sleep(2)
+@asynccontextmanager
+async def lifespan(_app):
+    # uvicorn runs this before serving; the compose service-level healthcheck
+    # keeps dependents waiting until the DB is ready and seeded.
+    last = None
+    for attempt in range(30):
+        try:
+            ensure_database()
+            init_db()
+            _get_pool().wait(timeout=30)
+            break
+        except Exception as exc:  # Postgres not up yet — retry
+            last = exc
+            if _pool is not None:
+                try:
+                    _pool.close()
+                except Exception:
+                    pass
+                globals()["_pool"] = None
+            if attempt == 29:
+                raise RuntimeError(f"pii-registry could not initialize DB: {last}")
+            time.sleep(2)
+    yield
+    if _pool is not None:
+        _pool.close()
+
+
+app.router.lifespan_context = lifespan
 
 
 # ──────────────────────────── auth ────────────────────────────
@@ -233,9 +316,18 @@ def resolve_overlaps(results, custom_entities=frozenset()):
     return chosen
 
 
-def mask_text(text, chosen):
-    """Replace detections with <TYPE_N> (global counter, document order)."""
-    tokens, spans, n = {}, [], 0
+# Detections whose matched text is already a placeholder token are ignored
+PLACEHOLDER_RE = re.compile(r"<[A-Z_]+_\d+>")
+
+
+def mask_text(text, chosen, start_n=0):
+    """Replace detections with <TYPE_N> (global counter, document order).
+
+    start_n lets a caller keep ONE global counter across several texts (per
+    LLM call), so every token is unique within the call and the restore map
+    never has the same token mapped to two different values.
+    """
+    tokens, spans, n = {}, [], start_n
     for r in chosen:
         n += 1
         token = f"<{r['entity_type']}_{n}>"
@@ -243,7 +335,7 @@ def mask_text(text, chosen):
         spans.append((r["start"], r["end"], token))
     for start, end, token in reversed(spans):
         text = text[:start] + token + text[end:]
-    return text, tokens
+    return text, tokens, n
 
 
 def call_analyzer(text, entities, ad_hoc):
@@ -298,14 +390,16 @@ def add_entity(body: EntityIn, _key: str = Depends(require_key)):
         raise HTTPException(400, "entity name must be UPPERCASE_SNAKE (letters/digits/_)")
     if body.action not in ("MASK", "BLOCK"):
         raise HTTPException(400, "action must be MASK or BLOCK")
-    if q("SELECT 1 FROM pii_entities WHERE name = %s", (body.name,), fetch=True):
+    try:
+        with tx() as cur:  # insert + audit + version bump land atomically
+            cur.execute(
+                "INSERT INTO pii_entities(name, action, updated_by) VALUES (%s, %s, %s)",
+                (body.name, body.action, "admin"),
+            )
+            audit("add-entity", body.name, body.model_dump(), cur=cur)
+            bump_version(cur=cur)
+    except pg_errors.UniqueViolation:
         raise HTTPException(409, f"entity '{body.name}' already exists")
-    q(
-        "INSERT INTO pii_entities(name, action, updated_by) VALUES (%s, %s, %s)",
-        (body.name, body.action, "admin"),
-    )
-    audit("add-entity", body.name, body.model_dump())
-    bump_version()
     return {"status": "created", "name": body.name, "action": body.action}
 
 
@@ -313,14 +407,26 @@ def add_entity(body: EntityIn, _key: str = Depends(require_key)):
 def patch_entity(name: str, body: EntityPatch, _key: str = Depends(require_key)):
     if not q("SELECT 1 FROM pii_entities WHERE name = %s", (name,), fetch=True):
         raise HTTPException(404, f"entity '{name}' not found")
+    sets, args = [], []
     if body.action is not None:
         if body.action not in ("MASK", "BLOCK"):
             raise HTTPException(400, "action must be MASK or BLOCK")
-        q("UPDATE pii_entities SET action = %s, updated_by = 'admin' WHERE name = %s", (body.action, name))
+        sets.append("action = %s")
+        args.append(body.action)
     if body.enabled is not None:
-        q("UPDATE pii_entities SET enabled = %s, updated_by = 'admin' WHERE name = %s", (body.enabled, name))
-    audit("patch-entity", name, body.model_dump(exclude_none=True))
-    bump_version()
+        sets.append("enabled = %s")
+        args.append(body.enabled)
+    if sets:
+        sets += ["updated_by = 'admin'", "updated_at = now()"]
+        args.append(name)
+        with tx() as cur:
+            cur.execute(f"UPDATE pii_entities SET {', '.join(sets)} WHERE name = %s", args)
+            audit("patch-entity", name, body.model_dump(exclude_none=True), cur=cur)
+            bump_version(cur=cur)
+    else:  # no-op patch still bumps so the gateway re-reads config
+        with tx() as cur:
+            audit("patch-entity", name, {}, cur=cur)
+            bump_version(cur=cur)
     row = q("SELECT * FROM pii_entities WHERE name = %s", (name,), fetch=True)
     return {"status": "updated", "entity": row[0]}
 
@@ -332,9 +438,10 @@ def delete_entity(name: str, _key: str = Depends(require_key)):
     orphans = q(
         "SELECT name FROM pii_recognizers WHERE spec->>'supported_entity' = %s", (name,), fetch=True
     )
-    q("DELETE FROM pii_entities WHERE name = %s", (name,))
-    audit("delete-entity", name, {"orphaned_recognizers": [o["name"] for o in orphans]})
-    bump_version()
+    with tx() as cur:
+        cur.execute("DELETE FROM pii_entities WHERE name = %s", (name,))
+        audit("delete-entity", name, {"orphaned_recognizers": [o["name"] for o in orphans]}, cur=cur)
+        bump_version(cur=cur)
     return {"status": "deleted", "name": name, "orphaned_recognizers": [o["name"] for o in orphans]}
 
 
@@ -362,18 +469,23 @@ def add_recognizer(body: RecognizerIn, _key: str = Depends(require_key)):
     if body.context:
         spec["context"] = body.context
 
-    # The entity must exist AND be requested for the recognizer to ever fire
-    q(
-        "INSERT INTO pii_entities(name, action, updated_by) VALUES (%s, %s, 'auto:recognizer')"
-        " ON CONFLICT (name) DO NOTHING",
-        (body.name, body.entity_action),
-    )
-    q(
-        "INSERT INTO pii_recognizers(name, spec, updated_by) VALUES (%s, %s::jsonb, %s)",
-        (body.name, json.dumps(spec), "admin"),
-    )
-    audit("add-recognizer", body.name, spec)
-    bump_version()
+    # The entity must exist AND be requested for the recognizer to ever fire.
+    # Everything (entity + recognizer + audit + version bump) is one transaction.
+    try:
+        with tx() as cur:
+            cur.execute(
+                "INSERT INTO pii_entities(name, action, updated_by) VALUES (%s, %s, 'auto:recognizer')"
+                " ON CONFLICT (name) DO NOTHING",
+                (body.name, body.entity_action),
+            )
+            cur.execute(
+                "INSERT INTO pii_recognizers(name, spec, updated_by) VALUES (%s, %s::jsonb, %s)",
+                (body.name, json.dumps(spec), "admin"),
+            )
+            audit("add-recognizer", body.name, spec, cur=cur)
+            bump_version(cur=cur)
+    except pg_errors.UniqueViolation:
+        raise HTTPException(409, f"recognizer '{body.name}' already exists")
     return {"status": "created", "name": body.name, "entity_action": body.entity_action, "spec": spec}
 
 
@@ -397,11 +509,18 @@ def patch_recognizer(name: str, body: RecognizerPatch, _key: str = Depends(requi
     if body.score is not None:
         for p in spec.get("patterns", []):
             p["score"] = body.score
-    q("UPDATE pii_recognizers SET spec = %s::jsonb, updated_by = 'admin' WHERE name = %s", (json.dumps(spec), name))
-    if body.enabled is not None:
-        q("UPDATE pii_recognizers SET enabled = %s, updated_by = 'admin' WHERE name = %s", (body.enabled, name))
-    audit("patch-recognizer", name, body.model_dump(exclude_none=True))
-    bump_version()
+    with tx() as cur:
+        cur.execute(
+            "UPDATE pii_recognizers SET spec = %s::jsonb, updated_by = 'admin', updated_at = now() WHERE name = %s",
+            (json.dumps(spec), name),
+        )
+        if body.enabled is not None:
+            cur.execute(
+                "UPDATE pii_recognizers SET enabled = %s, updated_by = 'admin', updated_at = now() WHERE name = %s",
+                (body.enabled, name),
+            )
+        audit("patch-recognizer", name, body.model_dump(exclude_none=True), cur=cur)
+        bump_version(cur=cur)
     row = q("SELECT * FROM pii_recognizers WHERE name = %s", (name,), fetch=True)
     return {"status": "updated", "recognizer": row[0]}
 
@@ -410,9 +529,10 @@ def patch_recognizer(name: str, body: RecognizerPatch, _key: str = Depends(requi
 def delete_recognizer(name: str, _key: str = Depends(require_key)):
     if not q("SELECT 1 FROM pii_recognizers WHERE name = %s", (name,), fetch=True):
         raise HTTPException(404, f"recognizer '{name}' not found")
-    q("DELETE FROM pii_recognizers WHERE name = %s", (name,))
-    audit("delete-recognizer", name)
-    bump_version()
+    with tx() as cur:
+        cur.execute("DELETE FROM pii_recognizers WHERE name = %s", (name,))
+        audit("delete-recognizer", name, cur=cur)
+        bump_version(cur=cur)
     return {"status": "deleted", "name": name}
 
 
@@ -420,8 +540,9 @@ def delete_recognizer(name: str, _key: str = Depends(require_key)):
 
 @app.post("/reload", tags=["ops"], summary="Force config version bump")
 def reload_config(_key: str = Depends(require_key)):
-    bump_version()
-    audit("reload", "*")
+    with tx() as cur:
+        bump_version(cur=cur)
+        audit("reload", "*", cur=cur)
     return {"status": "reloaded", "version": current_version()}
 
 
@@ -437,7 +558,7 @@ def dry_run(body: TestIn, _key: str = Depends(require_key)):
     except Exception as e:
         raise HTTPException(502, f"presidio analyzer error: {e}")
     chosen = resolve_overlaps(results, {r.get("supported_entity") for r in ad_hoc})
-    masked, tokens = mask_text(body.text, chosen)
+    masked, tokens, _n = mask_text(body.text, chosen)
     return {
         "detections": [
             {
@@ -452,3 +573,111 @@ def dry_run(body: TestIn, _key: str = Depends(require_key)):
         "masked_text": masked,
         "token_map": tokens,
     }
+
+
+# ──────────────────── LiteLLM Generic Guardrail API endpoint ────────────────────
+#
+# Lets LiteLLM register this registry as a LIVE presidio guardrail via the
+# gateway API (no config.yaml, no restarts):
+#
+#   ./pii.sh guardrail-add pii-presidio http://pii-registry:8080 pre_call true
+#   ./pii.sh guardrail-add pii-presidio-restore http://pii-registry:8080 post_call true
+#
+# Wire format (litellm GenericGuardrailAPI integration):
+#   request  {litellm_call_id, texts: [...], input_type: "request"|"response", ...}
+#   response {action: "NONE"|"BLOCKED"|"GUARDRAIL_INTERVENED",
+#             blocked_reason?, texts?: [...same length as input...]}
+# Returned texts are written back positionally into the message contents.
+# Fail-closed: analyzer down -> 502 (litellm rejects); registry down ->
+# litellm's unreachable_fallback="fail_closed" rejects. PII never leaks.
+
+_GR_TTL = int(os.getenv("PII_MAP_TTL_SECONDS", "900"))
+_GR_MAPS: dict = {}
+_GR_LOCK = __import__("threading").Lock()
+
+
+def _gr_store(call_id: str, tokens: dict):
+    if not call_id or not tokens:
+        return
+    now = time.time()
+    with _GR_LOCK:
+        _GR_MAPS[call_id] = {"tokens": tokens, "ts": now}
+        for k in [k for k, v in _GR_MAPS.items() if now - v["ts"] > _GR_TTL]:
+            _GR_MAPS.pop(k, None)
+        while len(_GR_MAPS) > 2000:
+            oldest = min(_GR_MAPS, key=lambda k: _GR_MAPS[k]["ts"])
+            _GR_MAPS.pop(oldest, None)
+
+
+def _gr_load(call_id):
+    if not call_id:
+        return {}
+    with _GR_LOCK:
+        entry = _GR_MAPS.get(call_id)
+        return dict(entry["tokens"]) if entry else {}
+
+
+class GenericGuardrailRequest(BaseModel):
+    # The rest of the payload (request_data, request_headers, structured_
+    # messages, tools, model, ...) is accepted and ignored.
+    model_config = {"extra": "allow"}
+    litellm_call_id: Optional[str] = None
+    texts: list[str] = []
+    input_type: str = "request"
+
+
+@app.post(
+    "/beta/litellm_basic_guardrail_api",
+    tags=["ops"],
+    summary="Generic Guardrail API — presidio mask (pre_call) / restore (post_call)",
+)
+def litellm_basic_guardrail_api(body: GenericGuardrailRequest, _key: str = Depends(require_key)):
+    cfg = effective()
+    actions = cfg["entities"]
+    entities = list(actions.keys())
+    ad_hoc = [r for r in cfg["recognizers"] if r.get("supported_entity") in actions]
+    custom_entities = {r.get("supported_entity") for r in ad_hoc}
+
+    if body.input_type != "response":  # pre_call: mask (or BLOCK)
+        if not body.texts:
+            return {"action": "NONE"}
+        out, tokens, n = [], {}, 0
+        for text in body.texts:
+            if not text:
+                out.append(text)
+                continue
+            try:
+                results = call_analyzer(text, entities, ad_hoc)
+            except Exception as e:
+                raise HTTPException(502, f"presidio analyzer error: {e}")
+            blocked = sorted({r["entity_type"] for r in results if actions.get(r["entity_type"]) == "BLOCK"})
+            if blocked:
+                return {
+                    "action": "BLOCKED",
+                    "blocked_reason": "Blocked by PII policy: " + ", ".join(blocked),
+                }
+            usable = [r for r in results if not PLACEHOLDER_RE.fullmatch(text[r["start"]:r["end"]])]
+            chosen = resolve_overlaps(usable, custom_entities)
+            masked, tk, n = mask_text(text, chosen, n)
+            tokens.update(tk)
+            out.append(masked)
+        if tokens:
+            _gr_store(body.litellm_call_id, tokens)
+            return {"action": "GUARDRAIL_INTERVENED", "texts": out}
+        return {"action": "NONE"}
+
+    # post_call: restore <TYPE_N> tokens (longest first) in the reply
+    tokens = _gr_load(body.litellm_call_id)
+    if not tokens or not body.texts:
+        return {"action": "NONE"}
+    out, changed = [], False
+    for text in body.texts:
+        restored = text
+        for token in sorted(tokens, key=len, reverse=True):
+            if token in restored:
+                restored = restored.replace(token, tokens[token])
+                changed = True
+        out.append(restored)
+    if changed:
+        return {"action": "GUARDRAIL_INTERVENED", "texts": out}
+    return {"action": "NONE"}

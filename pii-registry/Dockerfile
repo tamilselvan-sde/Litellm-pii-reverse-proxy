@@ -4,6 +4,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py pii_baseline.json ./
 EXPOSE 8080
-HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
+# NOTE: HEALTHCHECK is not embedded here on purpose — podman builds OCI
+# images where Dockerfile HEALTHCHECK is silently ignored. The healthcheck
+# lives at service level in docker-compose.yml instead.
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
